@@ -261,6 +261,7 @@ bool ${modulename}_initialize(JSGlobalContextRef context) {
     ${classname_mangled}_classDefinition.callAsConstructor = _wrap_create_${classname_mangled};
     ${classname_mangled}_objectDefinition.staticValues = ${classname_mangled}_values;
     ${classname_mangled}_objectDefinition.staticFunctions = ${classname_mangled}_functions;
+    ${classname_mangled}_objectDefinition.finalize = _wrap_${classname_mangled}_finalize;	
     ${classname_mangled}_objectDefinition.parentClass = ${base_classname}_classRef;
     JSClassRef ${classname_mangled}_classRef = JSClassCreate(&${classname_mangled}_objectDefinition);
     SWIGTYPE_${classtype_mangled}->clientdata = ${classname_mangled}_classRef;%}
