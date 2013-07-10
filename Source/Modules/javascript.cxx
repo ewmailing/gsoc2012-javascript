@@ -274,6 +274,7 @@ private:
   String *current_getter;
   String *current_setter;
   bool is_immutable;
+  int have_destructor;
 
   String *current_classname;
   String *current_classname_mangled;
@@ -541,7 +542,7 @@ Template & Template::replace(const String *pattern, const String *repl) {
 JSCEmitter::JSCEmitter()
 :  
 NULL_STR(NewString("NULL")), current_classname(NULL), f_header(NULL), current_classtype(NULL), f_runtime(NULL), current_class_functions(NULL),
-f_wrappers(NULL), current_getter(NULL), is_immutable(NULL), create_namespaces_code(NULL), current_classname_mangled(NULL), initializer_code(NULL),
+f_wrappers(NULL), current_getter(NULL), is_immutable(NULL), have_destructor(0), create_namespaces_code(NULL), current_classname_mangled(NULL), initializer_code(NULL),
 register_namespaces_code(NULL), f_wrap_cpp(NULL), current_setter(NULL), ctor_dispatcher_code(NULL), current_functionwrapper(NULL),
 class_static_functions_code(NULL), namespaces(NULL), function_dispatcher_code(NULL), GLOBAL_STR(NULL), current_propertyname(NULL),
 current_namespace(NULL), ctor_wrappers(NULL), class_static_variables_code(NULL), class_variables_code(NULL), f_init(NULL), current_functionname(NULL),
@@ -910,6 +911,18 @@ int JSCEmitter::exitClass(Node *n) {
     base_name_mangled = SwigType_manglestr(Getattr(base_class, "name"));
   }
 
+  /* If we need a destructor, we need to set it. Otherwise, we need to clear it. */
+  if( ! have_destructor)
+  {
+    // In the javascriptcode.swg, the JSCore finalizer is explicitly set to a default which is expected to be generated.
+	// The emitDtor code will dynamically change the generated implementation of the finalizer, but the function name
+	// will be the same in either case.
+	// But if %%nodefaultdtor is specified, then the finalizers are not generated. This means the .swg template code
+	// needs to be changed to not set a finalizer that doesn't exist. 
+	// The easiest thing to do is just change the assignment to NULL.
+    t_classtemplate.replace("_wrap_${classname_mangled}_finalize", "NULL");
+  }
+
   t_classtemplate.replace("${classname_mangled}", mangled_name)
       .replace("${classtype_mangled}", current_classtype_mangled)
       .replace("${base_classname}", base_name_mangled);
@@ -997,13 +1010,104 @@ int JSCEmitter::emitCtor(Node *n) {
 
 }
 
-int JSCEmitter::emitDtor(Node *) {
+int JSCEmitter::emitDtor(Node *n) {
+  have_destructor = 1;
+  String *freebody = NewString("");
+  String *pname0 = Swig_cparm_name(0, 0);
 
-  Template t_dtor = getTemplate("JS_destructordefn");
-  t_dtor.replace("${classname_mangled}", current_classname_mangled)
+
+  /* The if (Extend) block was taken from the Ruby implementation.
+   * The problem is that in the case of an %extend to create a destructor for a struct to coordinate automatic memory cleanup with the Javascript collector,
+   * the swig function was not being generated. More specifically:
+     struct MyData {
+       %extend {
+         ~MyData() {
+           FreeData($self);
+         }
+       }
+     };
+     %newobject CreateData;	 
+     struct MyData* CreateData(void);
+     %delobject FreeData;
+     void FreeData(struct MyData* the_data);
+	 
+	 where the use case is something like:
+	   var my_data = example.CreateData();
+	   my_data = null;
+     
+	 This function was not being generated:
+	 SWIGINTERN void delete_MyData(struct MyData *self){
+       FreeData(self);
+     }
+
+     I don't understand fully why it wasn't being generated. It just seems to happen in the Lua generator.
+	 There is a comment about staticmemberfunctionHandler having an inconsistency and I tracked down dome of the SWIGINTERN void delete_*
+	 code to that function in the Language base class.
+	 The Ruby implementation seems to have an explicit check for if(Extend) and explicitly generates the code, so that's what I'm doing here.
+	 The Ruby implementation does other stuff which I omit.
+  */
+  if (Extend) {
+    String *wrap = Getattr(n, "wrap:code");
+    if (wrap) {
+      Printv(f_wrappers, wrap, NIL);
+    }
+  }
+
+  /* The next challenge is to generate the correct finalize function for JavaScriptCore to call.
+     Originally, it would use this fragment from javascriptcode.swg
+	 %fragment ("JS_destructordefn", "templates")
+     %{
+     void _wrap_${classname_mangled}_finalize(JSObjectRef thisObject)
+     {
+        SWIG_PRV_DATA* t = (SWIG_PRV_DATA*)JSObjectGetPrivate(thisObject);
+        if(t && t->swigCMemOwn) free ((${type}*)t->swigCObject);
+        if(t) free(t);
+     }
+     %}
+
+     But for the above example case of %extend to define a destructor on a struct, we need to override the system to not call
+     free ((${type}*)t->swigCObject);
+	 and substitute it with what the user has provided.
+     To solve this, I created a variation fragment called JS_destructoroverridedefn:
+     SWIG_PRV_DATA* t = (SWIG_PRV_DATA*)JSObjectGetPrivate(thisObject);
+     if(t && t->swigCMemOwn) {
+       ${type}* arg1 = (${type}*)t->swigCObject;
+       ${destructor_action}
+     }
+     if(t) free(t);
+
+	 Based on what I saw in the Lua and Ruby modules, I use Getattr(n, "wrap:action")
+	 to decide if the user has a preferred destructor action.
+	 Based on that, I decide which fragment to use.
+	 And in the case of the custom action, I substitute that action in.
+	 I noticed that destructor_action has the form 
+       delete_MyData(arg1);
+     The explicit arg1 is a little funny, so I structured the fragment to create a temporary variable called arg1 to make the generation easier.
+     This might suggest this solution misunderstands a more complex case.
+
+	 Also, there is a problem where destructor_action is always true for me, even when not requesting %extend as above.
+	 So this code doesn't actually quite work as I expect. The end result is that the code still works because 
+	 destructor_action calls free like the original template. The one caveat is the string in destructor_action casts to char* which is wierd.
+	 I think there is a deeper underlying SWIG issue because I don't think it should be char*. However, it doesn't really matter for free.
+
+	 Maybe the fix for the destructor_action always true problem is that this is supposed to be embedded in the if(Extend) block above.
+	 But I don't fully understand the conditions of any of these things, and since it works for the moment, I don't want to break more stuff.
+  */
+  String* destructor_action = Getattr(n, "wrap:action");
+  if(destructor_action) {
+    Template t_dtor = getTemplate("JS_destructoroverridedefn");
+    t_dtor.replace("${classname_mangled}", current_classname_mangled)
       .replace("${type}", current_classtype);
-  Wrapper_pretty_print(t_dtor.str(), f_wrappers);
 
+    t_dtor.replace("${destructor_action}", destructor_action);
+    Wrapper_pretty_print(t_dtor.str(), f_wrappers);
+  }
+  else {
+    Template t_dtor = getTemplate("JS_destructordefn");
+    t_dtor.replace("${classname_mangled}", current_classname_mangled)
+      .replace("${type}", current_classtype);
+    Wrapper_pretty_print(t_dtor.str(), f_wrappers);
+  }
   return SWIG_OK;
 }
 

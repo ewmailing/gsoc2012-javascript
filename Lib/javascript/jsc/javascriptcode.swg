@@ -162,6 +162,26 @@ void _wrap_${classname_mangled}_finalize(JSObjectRef thisObject)
 %}
 
 /*********************************************************************
+ * destructoroverridedefn:
+ * This code template is used to adds the destructor wrapper function 
+ * ${classname_mangled}: The mangled name of the qualified class name, e.g., foo::A -> foo_A
+ * ${destructor_action}: The custom destructor action to invoke.
+***********************************************************************/
+
+%fragment ("JS_destructoroverridedefn", "templates")
+%{
+void _wrap_${classname_mangled}_finalize(JSObjectRef thisObject)
+{
+  SWIG_PRV_DATA* t = (SWIG_PRV_DATA*)JSObjectGetPrivate(thisObject);
+  if(t && t->swigCMemOwn) {
+    ${type}* arg1 = (${type}*)t->swigCObject;
+    ${destructor_action}
+  }
+  if(t) free(t);
+}
+%}
+
+/*********************************************************************
  * constructor_definition:
  * This code template is used to adds the main constructor wrapper function 
  * ${classname_mangled}: The mangled name of the qualified class name, e.g., foo::A -> foo_A
